@@ -1,0 +1,74 @@
+body {
+    font-family: Arial, sans-serif;
+    text-align: center;
+    margin: 20px;
+    background-color: #f9f9f9;
+    color: #333;
+}
+
+.hidden {
+    display: none !important;
+}
+
+.team {
+    margin: 10px;
+    padding: 10px;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    background-color: #fff;
+}
+
+.current {
+    background: #fffae6;
+    border: 2px solid orange;
+    font-weight: bold;
+    padding: 4px;
+    border-radius: 4px;
+}
+
+button {
+    padding: 10px 20px;
+    margin: 10px;
+    font-size: 16px;
+    cursor: pointer;
+    border-radius: 5px;
+    border: none;
+    background-color: #007bff;
+    color: white;
+}
+
+button:hover {
+    background-color: #0056b3;
+}
+
+button:disabled {
+    background-color: #cccccc;
+    cursor: not-allowed;
+}
+
+input[type="text"],
+input[type="number"] {
+    padding: 5px;
+    margin: 5px;
+    font-size: 14px;
+}
+
+.penalty {
+    color: #d9534f;
+    font-weight: bold;
+}
+
+#visual {
+    font-size: 24px;
+    margin-top: 40px;
+}
+
+#actionText {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+#countdown {
+    font-size: 22px;
+    color: #d9534f;
+}
