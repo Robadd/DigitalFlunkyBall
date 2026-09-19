@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex">
+  <title>Teamspiel Admin</title>
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="admin">
+  <header>
+    <h1>⚙️ Teamspiel Admin</h1>
+  </header>
+  <main>
+    <form id="login" class="card hidden">
+      <h2>Anmelden</h2>
+      <label>Passwort <input type="password" id="pw" autocomplete="current-password" required></label>
+      <button type="submit">Anmelden</button>
+    </form>
+
+    <div id="panel" class="hidden">
+      <section class="card">
+        <h2>Spiel</h2>
+        <p>Phase: <strong id="phase"></strong></p>
+        <ul id="players" class="plain"></ul>
+        <div class="row">
+          <button type="button" id="refresh">Aktualisieren</button>
+          <button type="button" id="reset">Spiel zurücksetzen</button>
+          <button type="button" id="kick" class="danger">Alle Spieler entfernen</button>
+        </div>
+      </section>
+
+      <form id="settings" class="card">
+        <h2>Einstellungen</h2>
+        <label>Team 1 Name <input type="text" name="team1Name" maxlength="30"></label>
+        <label>Team 2 Name <input type="text" name="team2Name" maxlength="30"></label>
+        <label class="check"><input type="checkbox" name="strafbier"> Fortgeschrittener Modus (Strafbier)</label>
+        <h3>Standardzeiten</h3>
+        <p class="muted">Sekunden bei Tempo 5. Tempo 1 braucht ×1,4, Tempo 10 nur ×0,5.</p>
+        <div class="times">
+          <label>Hinlaufen <input type="number" name="tRunTo" min="0.5" max="60" step="0.5"></label>
+          <label>Flasche aufstellen <input type="number" name="tSetUp" min="0.5" max="60" step="0.5"></label>
+          <label>Zurücklaufen <input type="number" name="tRunBack" min="0.5" max="60" step="0.5"></label>
+          <label>Ball holen <input type="number" name="tFetch" min="0.5" max="60" step="0.5"></label>
+        </div>
+        <label>Zufallsschwankung: ±<output data-for="variance"></output> %
+          <input type="range" name="variance" min="0" max="50" step="5"></label>
+        <label>Trefferwahrscheinlichkeit: <output data-for="hitChance"></output> %
+          <input type="range" name="hitChance" min="0" max="100" step="5"></label>
+        <label>Strafbier-Wahrscheinlichkeit: <output data-for="beerChance"></output> %
+          <input type="range" name="beerChance" min="0" max="100" step="5"></label>
+        <label>Umkipp-Wahrscheinlichkeit: <output data-for="tipChance"></output> %
+          <input type="range" name="tipChance" min="0" max="100" step="5"></label>
+        <label>Start-Verzögerung (Sekunden) <input type="number" name="startDelay" min="0" max="120"></label>
+        <label>Übertragung
+          <select name="transport">
+            <option value="poll">Polling alle 0,5 s (empfohlen)</option>
+            <option value="sse">SSE (nur nach erfolgreichem Server-Test)</option>
+          </select>
+        </label>
+        <button type="submit">Speichern</button>
+      </form>
+
+      <section class="card">
+        <h2>Spieler</h2>
+        <p class="muted">Geschwindigkeit 1 (langsam) bis 10 (schnell), 5 = normal.</p>
+        <div id="roster"></div>
+        <form id="add" class="roster-item">
+          <input type="text" name="name" placeholder="Neuer Name" maxlength="40" required>
+          <label class="speed">Tempo <input type="range" name="speed" min="1" max="10" value="5"><output>5</output></label>
+          <button type="submit">Hinzufügen</button>
+        </form>
+      </section>
+
+      <button type="button" id="logout" class="link">Abmelden</button>
+    </div>
+  </main>
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="admin.js"></script>
+</body>
+</html>
