@@ -9,20 +9,31 @@ define('TOUCH_EVERY', 5);
 
 $GLOBALS['__pdo'] = null;
 
+/**
+ * Settings from config.php (database access, admin password hash), read once per request.
+ *
+ * @return array
+ */
 function cfg()
 {
-    static $c = null;
-    if ($c === null) {
-        $c = require __DIR__ . '/config.php';
+    static $config = null;
+    if ($config === null) {
+        $config = require __DIR__ . '/config.php';
     }
-    return $c;
+    return $config;
 }
 
+/**
+ * Shared database connection, opened on first use.
+ * Errors throw PDOException; rows come back as associative arrays.
+ *
+ * @return PDO
+ */
 function db()
 {
     if ($GLOBALS['__pdo'] === null) {
-        $c = cfg();
-        $GLOBALS['__pdo'] = new PDO($c['db_dsn'], $c['db_user'], $c['db_pass'], array(
+        $config = cfg();
+        $GLOBALS['__pdo'] = new PDO($config['db_dsn'], $config['db_user'], $config['db_pass'], array(
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ));
@@ -30,6 +41,12 @@ function db()
     return $GLOBALS['__pdo'];
 }
 
+/**
+ * Rolls back the open transaction, if any, so a failed request leaves the database unchanged.
+ * Safe to call when no connection was ever opened.
+ *
+ * @return void
+ */
 function rollback_open()
 {
     $pdo = $GLOBALS['__pdo'];
@@ -38,70 +55,126 @@ function rollback_open()
     }
 }
 
-function json_out($data, $code = 200)
+/**
+ * Sends $data as the JSON response and ends the request.
+ *
+ * @param mixed $data       Anything json_encode() accepts.
+ * @param int   $httpStatus HTTP status code.
+ * @return void Never returns.
+ */
+function json_out($data, $httpStatus = 200)
 {
-    http_response_code($code);
+    http_response_code($httpStatus);
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
     echo json_encode($data, JSON_UNESCAPED_UNICODE);
     exit;
 }
 
-function fail($msg, $code = 400)
+/**
+ * Ends the request with {"error": $message}, rolling back any open transaction first.
+ *
+ * @param string $message    Shown to the player, so it is in German.
+ * @param int    $httpStatus 400 bad request, 403 not allowed, 409 the game has moved on
+ *                           (the player's page then refreshes quietly instead of showing it).
+ * @return void Never returns.
+ */
+function fail($message, $httpStatus = 400)
 {
     rollback_open();
-    json_out(array('error' => $msg), $code);
+    json_out(array('error' => $message), $httpStatus);
 }
 
-set_exception_handler(function ($e) {
+// Unexpected errors: roll back, log the details, and send the client only a generic message.
+set_exception_handler(function ($exception) {
     rollback_open();
-    error_log('Teamspiel: ' . $e);
+    error_log('Teamspiel: ' . $exception);
     if (!headers_sent()) {
         json_out(array('error' => 'Serverfehler'), 500);
     }
     exit;
 });
 
+/**
+ * @return float Current server time in Unix seconds, with microseconds.
+ */
 function now()
 {
     return microtime(true);
 }
 
+/**
+ * @return float Random number from 0 to 1, both inclusive.
+ */
 function rnd()
 {
     return mt_rand() / mt_getrandmax();
 }
 
+/**
+ * Rolls a percentage chance.
+ *
+ * @param int $percent 0 never succeeds, 100 always does.
+ * @return bool
+ */
 function chance($percent)
 {
     return mt_rand(1, 100) <= $percent;
 }
 
+/**
+ * @return string Random 32-character hex token that identifies a joined player.
+ */
 function new_token()
 {
     $bytes = function_exists('random_bytes') ? random_bytes(16) : openssl_random_pseudo_bytes(16);
     return bin2hex($bytes);
 }
 
-function clean_token($t)
+/**
+ * Keeps malformed tokens out of queries and comparisons.
+ *
+ * @param string $token Token sent by the client.
+ * @return string $token if it has the format new_token() produces, otherwise ''.
+ */
+function clean_token($token)
 {
-    return preg_match('/^[a-f0-9]{32}$/', $t) ? $t : '';
+    return preg_match('/^[a-f0-9]{32}$/', $token) ? $token : '';
 }
 
-function arg($a, $k, $default = null)
+/**
+ * Reads one value from a request array. Unlike isset(), a sent null stays null.
+ *
+ * @param array  $array   Usually the decoded request body.
+ * @param string $key
+ * @param mixed  $default Returned when $key is missing.
+ * @return mixed
+ */
+function arg($array, $key, $default = null)
 {
-    return array_key_exists($k, $a) ? $a[$k] : $default;
+    return array_key_exists($key, $array) ? $array[$key] : $default;
 }
 
+/**
+ * Decodes the JSON request body. Ends the request with 400 unless it is a JSON object.
+ *
+ * @return array
+ */
 function read_json_body()
 {
-    $in = json_decode(file_get_contents('php://input'), true);
-    if (!is_array($in)) {
+    $body = json_decode(file_get_contents('php://input'), true);
+    if (!is_array($body)) {
         fail('Ungültige Anfrage.');
     }
-    return $in;
+    return $body;
 }
 
+/**
+ * Settings used until the admin saves others. Also fills in keys missing from saved settings,
+ * so new settings work without a migration.
+ *
+ * @return array
+ */
 function default_settings()
 {
     return array(
@@ -123,13 +196,24 @@ function default_settings()
     );
 }
 
+/**
+ * Admin settings from the database, merged over default_settings().
+ * Prefer Game::settings(), which loads them only once per request.
+ *
+ * @return array
+ */
 function load_settings()
 {
     $row = db()->query('SELECT json FROM settings WHERE id = 1')->fetch();
-    $s = $row ? json_decode($row['json'], true) : null;
-    return array_merge(default_settings(), is_array($s) ? $s : array());
+    $saved = $row ? json_decode($row['json'], true) : null;
+    return array_merge(default_settings(), is_array($saved) ? $saved : array());
 }
 
+/**
+ * State of a fresh game waiting in the lobby. See Game::$s for what each key means.
+ *
+ * @return array
+ */
 function empty_state()
 {
     return array(
@@ -149,33 +233,87 @@ function empty_state()
 
 class Game
 {
+    /**
+     * Game state, stored as JSON in the single `game` row and sent to every client.
+     * All times are Unix seconds (float, server clock).
+     *
+     * - phase:        'lobby' | 'turn' | 'strafbier' | 'miss' | 'countdown' | 'stop' | 'over'
+     * - start_at:     lobby auto-start time; null until everyone is ready
+     * - teams:        [1 => int[], 2 => int[]] roster ids still playing, in throwing order
+     * - turn_index:   turn counter; even = team 1, odd = team 2, floor(n / 2) picks the player
+     * - thrower:      roster id of the current thrower
+     * - thrower_team: the thrower's team, kept even if the thrower finishes mid-turn
+     * - hit:          current hit (setter/fetcher ids, start/end times, setter timeline,
+     *                 solo flag, end = null until all jobs are assigned); null otherwise
+     * - pending_hit:  throw result rolled in advance while a Strafbier is shown
+     * - offline:      roster ids without a poll for OFFLINE_AFTER seconds
+     * - finished:     [['id' => int, 'team' => int], ...] players whose beer is empty
+     * - winner:       team that ran out of players first; set when phase is 'over'
+     *
+     * @var array
+     */
     public $s;
+
+    /** @var int State version; commit() bumps it on every change and clients poll with it. */
     public $v;
+
+    /**
+     * Joined players keyed by roster id, in join order. Each entry holds
+     * token, id, name, speed (1-10), team (null in the lobby), ready, last_seen.
+     *
+     * @var array<int, array>
+     */
     public $players;
+
+    /** @var float Request time; every timing decision in one request uses this same value. */
     public $now;
+
+    /** @var bool Set by mutations; commit() only writes and bumps the version when true. */
     public $changed = false;
+
+    /** @var bool True while open(true) holds the row lock; commit() ends the transaction. */
     private $locked = false;
+
+    /** @var array|null Admin settings, loaded on first use by settings(). */
     private $settings = null;
 
+    /**
+     * Loads the game and its joined players.
+     *
+     * With $lock the game row is read with SELECT ... FOR UPDATE inside a transaction, so
+     * concurrent requests wait until commit(). Every change must go through a locked Game.
+     * Without $lock it is a cheap read for polling. Keys missing from the stored state
+     * fall back to empty_state(), so states saved by older versions still load.
+     *
+     * @param bool $lock Lock the game row until commit().
+     * @return Game
+     * @throws RuntimeException If the game row is missing (sql/schema.sql not imported).
+     */
     public static function open($lock)
     {
-        $g = new Game();
-        $g->now = now();
+        $game = new Game();
+        $game->now = now();
         if ($lock) {
             db()->beginTransaction();
-            $g->locked = true;
+            $game->locked = true;
         }
         $row = db()->query('SELECT state, version FROM game WHERE id = 1' . ($lock ? ' FOR UPDATE' : ''))->fetch();
         if (!$row) {
             throw new RuntimeException('game row missing - import sql/schema.sql');
         }
-        $st = json_decode($row['state'], true);
-        $g->s = array_merge(empty_state(), is_array($st) ? $st : array());
-        $g->v = (int)$row['version'];
-        $g->loadPlayers();
-        return $g;
+        $stored = json_decode($row['state'], true);
+        $game->s = array_merge(empty_state(), is_array($stored) ? $stored : array());
+        $game->v = (int)$row['version'];
+        $game->loadPlayers();
+        return $game;
     }
 
+    /**
+     * Reads the joined players with their roster name and speed into $players.
+     * Call it again after changing the players table so later logic sees the change.
+     *
+     * @return void
+     */
     public function loadPlayers()
     {
         $rows = db()->query(
@@ -183,20 +321,25 @@ class Game
              FROM players p JOIN roster r ON r.id = p.roster_id ORDER BY p.joined_at'
         )->fetchAll();
         $this->players = array();
-        foreach ($rows as $r) {
-            $id = (int)$r['roster_id'];
-            $this->players[$id] = array(
-                'token' => $r['token'],
-                'id' => $id,
-                'name' => $r['name'],
-                'speed' => (int)$r['speed'],
-                'team' => $r['team'] === null ? null : (int)$r['team'],
-                'ready' => (bool)$r['ready'],
-                'last_seen' => (float)$r['last_seen'],
+        foreach ($rows as $row) {
+            $rosterId = (int)$row['roster_id'];
+            $this->players[$rosterId] = array(
+                'token' => $row['token'],
+                'id' => $rosterId,
+                'name' => $row['name'],
+                'speed' => (int)$row['speed'],
+                'team' => $row['team'] === null ? null : (int)$row['team'],
+                'ready' => (bool)$row['ready'],
+                'last_seen' => (float)$row['last_seen'],
             );
         }
     }
 
+    /**
+     * Admin settings merged over default_settings(); read from the database once per Game.
+     *
+     * @return array
+     */
     public function settings()
     {
         if ($this->settings === null) {
@@ -205,24 +348,42 @@ class Game
         return $this->settings;
     }
 
+    /**
+     * Finds the joined player a client token belongs to. The token is the player's only
+     * credential, so it is compared in constant time.
+     *
+     * @param string $token Token from the client, already checked by clean_token(); '' for none.
+     * @return array|null The player's entry from $players, or null if the token isn't joined.
+     */
     public function byToken($token)
     {
         if ($token === '') {
             return null;
         }
-        foreach ($this->players as $p) {
-            if (hash_equals($p['token'], $token)) {
-                return $p;
+        foreach ($this->players as $player) {
+            if (hash_equals($player['token'], $token)) {
+                return $player;
             }
         }
         return null;
     }
 
-    public function isOffline($p)
+    /**
+     * @param array $player An entry of $players.
+     * @return bool True if the player hasn't polled for OFFLINE_AFTER seconds as of $now.
+     */
+    public function isOffline($player)
     {
-        return $p['last_seen'] < $this->now - OFFLINE_AFTER;
+        return $player['last_seen'] < $this->now - OFFLINE_AFTER;
     }
 
+    /**
+     * Saves the state and bumps the version if $changed, then ends the transaction if the
+     * row is locked. Call it once when the request's changes are done; fail() rolls back
+     * instead. Also safe on an unlocked Game, where it only writes if something changed.
+     *
+     * @return void
+     */
     public function commit()
     {
         if ($this->changed) {
@@ -238,18 +399,31 @@ class Game
     }
 }
 
-// Reads without a lock and only locks when a time-based transition is due.
+/**
+ * Loads the game for reading and runs any time-based step that is due: auto-start,
+ * job assignment, Stopp, offline players. The host has no cron, so polls drive these steps.
+ * Polls stay lock-free; the row is only locked when tick_due() finds something to do.
+ *
+ * @return Game
+ */
 function sync_game()
 {
-    $g = Game::open(false);
-    if (tick_due($g)) {
-        $g = Game::open(true);
-        tick($g);
-        $g->commit();
+    $game = Game::open(false);
+    if (tick_due($game)) {
+        $game = Game::open(true);
+        tick($game);
+        $game->commit();
     }
-    return $g;
+    return $game;
 }
 
+/**
+ * Records that a player is still connected. Writes at most every TOUCH_EVERY seconds per
+ * player, so polling twice a second doesn't mean two writes a second.
+ *
+ * @param string $token The player's token; '' does nothing.
+ * @return void
+ */
 function touch_player($token)
 {
     if ($token === '') {
@@ -260,246 +434,343 @@ function touch_player($token)
         ->execute(array($now, $token, $now - TOUCH_EVERY));
 }
 
-function offline_ids($g)
+/**
+ * @param Game $game
+ * @return int[] Roster ids of joined players that count as offline now, sorted so the list
+ *               can be compared directly with $game->s['offline'].
+ */
+function offline_ids($game)
 {
     $ids = array();
-    foreach ($g->players as $p) {
-        if ($g->isOffline($p)) {
-            $ids[] = $p['id'];
+    foreach ($game->players as $player) {
+        if ($game->isOffline($player)) {
+            $ids[] = $player['id'];
         }
     }
     sort($ids);
     return $ids;
 }
 
-// The thrower has to press "Weiter"; if they are offline or already finished, nobody can.
-function thrower_stuck($s)
+/**
+ * True if the game waits for the thrower (to throw or press "Weiter") but the thrower is
+ * offline or already finished, so nobody could move the game on.
+ *
+ * @param array $state Game::$s
+ * @return bool
+ */
+function thrower_stuck($state)
 {
-    return in_array($s['phase'], array('turn', 'strafbier', 'miss', 'stop'), true)
-        && (in_array($s['thrower'], $s['offline'], true) || team_of($s, $s['thrower']) === null);
+    return in_array($state['phase'], array('turn', 'strafbier', 'miss', 'stop'), true)
+        && (in_array($state['thrower'], $state['offline'], true) || team_of($state, $state['thrower']) === null);
 }
 
-function tick_due($g)
+/**
+ * Checks without a lock whether tick() has anything to do. Must cover every case tick()
+ * handles; a case missing here would only happen on the next player action.
+ *
+ * @param Game $game An unlocked game.
+ * @return bool
+ */
+function tick_due($game)
 {
-    $s = $g->s;
-    if ($s['phase'] === 'lobby') {
-        if ($s['start_at'] !== null && $g->now >= $s['start_at']) {
+    $state = $game->s;
+    if ($state['phase'] === 'lobby') {
+        if ($state['start_at'] !== null && $game->now >= $state['start_at']) {
             return true;
         }
-        foreach ($g->players as $p) {
-            if ($g->isOffline($p)) {
+        foreach ($game->players as $player) {
+            if ($game->isOffline($player)) {
                 return true;
             }
         }
         return false;
     }
-    if (offline_ids($g) !== $s['offline'] || thrower_stuck($s)) {
+    if (offline_ids($game) !== $state['offline'] || thrower_stuck($state)) {
         return true;
     }
-    if ($s['phase'] === 'countdown') {
-        $h = $s['hit'];
-        if (roles_open($h) && $g->now >= $h['started'] + CLAIM_TIMEOUT) {
+    if ($state['phase'] === 'countdown') {
+        $hit = $state['hit'];
+        if (roles_open($hit) && $game->now >= $hit['started'] + CLAIM_TIMEOUT) {
             return true;
         }
-        if ($h['end'] !== null && $g->now >= $h['end']) {
+        if ($hit['end'] !== null && $game->now >= $hit['end']) {
             return true;
         }
     }
     return false;
 }
 
-// Must run inside a locked Game.
-function tick($g)
+/**
+ * Applies the time-based steps.
+ * Lobby: removes offline players and starts the game once start_at has passed.
+ * In a game: updates the offline list, moves past a stuck thrower, assigns jobs nobody
+ * claimed within CLAIM_TIMEOUT, and switches to Stopp when the countdown ends.
+ *
+ * @param Game $game A locked game.
+ * @return void
+ */
+function tick($game)
 {
-    $s = &$g->s;
-    if ($s['phase'] === 'lobby') {
-        $gone = array();
-        foreach ($g->players as $p) {
-            if ($g->isOffline($p)) {
-                $gone[] = $p['token'];
+    $state = &$game->s;
+    if ($state['phase'] === 'lobby') {
+        $goneTokens = array();
+        foreach ($game->players as $player) {
+            if ($game->isOffline($player)) {
+                $goneTokens[] = $player['token'];
             }
         }
-        if ($gone) {
-            $del = db()->prepare('DELETE FROM players WHERE token = ?');
-            foreach ($gone as $t) {
-                $del->execute(array($t));
+        if ($goneTokens) {
+            $delete = db()->prepare('DELETE FROM players WHERE token = ?');
+            foreach ($goneTokens as $token) {
+                $delete->execute(array($token));
             }
-            $g->loadPlayers();
-            lobby_recheck($g);
+            $game->loadPlayers();
+            lobby_recheck($game);
         }
-        if ($s['start_at'] !== null && $g->now >= $s['start_at']) {
-            start_game($g);
+        if ($state['start_at'] !== null && $game->now >= $state['start_at']) {
+            start_game($game);
         }
         return;
     }
 
-    $off = offline_ids($g);
-    if ($off !== $s['offline']) {
-        $s['offline'] = $off;
-        $g->changed = true;
+    $offline = offline_ids($game);
+    if ($offline !== $state['offline']) {
+        $state['offline'] = $offline;
+        $game->changed = true;
     }
-    if (thrower_stuck($s)) {
-        advance($g);
+    if (thrower_stuck($state)) {
+        advance($game);
     }
-    if ($s['phase'] === 'countdown') {
-        $h = $s['hit'];
-        if (roles_open($h) && $g->now >= $h['started'] + CLAIM_TIMEOUT) {
-            auto_assign($g);
+    if ($state['phase'] === 'countdown') {
+        $hit = $state['hit'];
+        if (roles_open($hit) && $game->now >= $hit['started'] + CLAIM_TIMEOUT) {
+            auto_assign($game);
         }
-        if ($s['hit']['end'] !== null && $g->now >= $s['hit']['end']) {
-            $s['phase'] = 'stop';
-            $g->changed = true;
+        if ($state['hit']['end'] !== null && $game->now >= $state['hit']['end']) {
+            $state['phase'] = 'stop';
+            $game->changed = true;
         }
     }
 }
 
-function lobby_recheck($g)
+/**
+ * Starts the lobby countdown once at least 2 players are joined and all are ready, and
+ * cancels it otherwise. A countdown that is already running keeps its start time.
+ * Call it after anything changes who is joined or ready.
+ *
+ * @param Game $game A locked game in the lobby.
+ * @return void
+ */
+function lobby_recheck($game)
 {
-    $s = &$g->s;
-    $all = count($g->players) >= 2;
-    foreach ($g->players as $p) {
-        if (!$p['ready']) {
-            $all = false;
+    $state = &$game->s;
+    $allReady = count($game->players) >= 2;
+    foreach ($game->players as $player) {
+        if (!$player['ready']) {
+            $allReady = false;
             break;
         }
     }
-    if ($all && $s['start_at'] === null) {
-        $set = $g->settings();
-        $s['start_at'] = $g->now + $set['startDelay'];
-    } elseif (!$all) {
-        $s['start_at'] = null;
+    if ($allReady && $state['start_at'] === null) {
+        $settings = $game->settings();
+        $state['start_at'] = $game->now + $settings['startDelay'];
+    } elseif (!$allReady) {
+        $state['start_at'] = null;
     }
-    $g->changed = true;
+    $game->changed = true;
 }
 
-function unready_all($g)
+/**
+ * Sets every player to not ready and cancels the lobby countdown, e.g. when someone new
+ * joins or the admin changes the settings.
+ *
+ * @param Game $game A locked game in the lobby.
+ * @return void
+ */
+function unready_all($game)
 {
     db()->exec('UPDATE players SET ready = 0');
-    $g->loadPlayers();
-    $g->s['start_at'] = null;
-    $g->changed = true;
+    $game->loadPlayers();
+    $game->s['start_at'] = null;
+    $game->changed = true;
 }
 
-function reset_game($g)
+/**
+ * Ends the current game and returns to the lobby. Everyone stays joined but not ready.
+ *
+ * @param Game $game A locked game.
+ * @return void
+ */
+function reset_game($game)
 {
     db()->exec('UPDATE players SET ready = 0, team = NULL');
-    $g->loadPlayers();
-    $g->s = empty_state();
-    $g->changed = true;
+    $game->loadPlayers();
+    $game->s = empty_state();
+    $game->changed = true;
 }
 
-function start_game($g)
+/**
+ * Shuffles the joined players into two teams (alternating, so the sizes differ by at most
+ * one), saves each player's team and starts the first turn.
+ *
+ * @param Game $game A locked game in the lobby.
+ * @return void
+ */
+function start_game($game)
 {
-    $ids = array_keys($g->players);
-    shuffle($ids);
+    $rosterIds = array_keys($game->players);
+    shuffle($rosterIds);
     $teams = array(1 => array(), 2 => array());
-    foreach ($ids as $i => $id) {
-        $teams[$i % 2 === 0 ? 1 : 2][] = (int)$id;
+    foreach ($rosterIds as $position => $rosterId) {
+        $teams[$position % 2 === 0 ? 1 : 2][] = (int)$rosterId;
     }
-    $upd = db()->prepare('UPDATE players SET team = ? WHERE roster_id = ?');
-    foreach ($teams as $t => $list) {
-        foreach ($list as $id) {
-            $upd->execute(array($t, $id));
+    $update = db()->prepare('UPDATE players SET team = ? WHERE roster_id = ?');
+    foreach ($teams as $team => $members) {
+        foreach ($members as $rosterId) {
+            $update->execute(array($team, $rosterId));
         }
     }
-    $g->loadPlayers();
+    $game->loadPlayers();
 
-    $s = &$g->s;
-    $s['start_at'] = null;
-    $s['teams'] = $teams;
-    $s['turn_index'] = 0;
-    $s['offline'] = array();
-    begin_turn($g);
+    $state = &$game->s;
+    $state['start_at'] = null;
+    $state['teams'] = $teams;
+    $state['turn_index'] = 0;
+    $state['offline'] = array();
+    begin_turn($game);
 }
 
-function team_of($s, $rid)
+/**
+ * @param array $state    Game::$s
+ * @param int   $rosterId
+ * @return int|null 1 or 2 while the player is in a team; null if not playing or finished.
+ */
+function team_of($state, $rosterId)
 {
-    foreach (array(1, 2) as $t) {
-        if (in_array($rid, $s['teams'][$t], true)) {
-            return $t;
+    foreach (array(1, 2) as $team) {
+        if (in_array($rosterId, $state['teams'][$team], true)) {
+            return $team;
         }
     }
     return null;
 }
 
-// Teams alternate; within a team the thrower rotates. Offline players are skipped.
-function begin_turn($g)
+/**
+ * Starts the turn for the current turn_index. Teams alternate, and within a team the
+ * thrower rotates. Offline players are skipped while anyone in the team is online.
+ *
+ * @param Game $game A locked game.
+ * @return void
+ */
+function begin_turn($game)
 {
-    $s = &$g->s;
-    $team = $s['turn_index'] % 2 === 0 ? 1 : 2;
-    $list = $s['teams'][$team];
-    $n = count($list);
-    $k = (int)floor($s['turn_index'] / 2);
-    $pick = $list[$k % $n];
-    for ($i = 0; $i < $n; $i++) {
-        $id = $list[($k + $i) % $n];
-        if (!in_array($id, $s['offline'], true)) {
-            $pick = $id;
+    $state = &$game->s;
+    $team = $state['turn_index'] % 2 === 0 ? 1 : 2;
+    $members = $state['teams'][$team];
+    $memberCount = count($members);
+    $round = (int)floor($state['turn_index'] / 2);
+    $thrower = $members[$round % $memberCount];
+    for ($offset = 0; $offset < $memberCount; $offset++) {
+        $candidate = $members[($round + $offset) % $memberCount];
+        if (!in_array($candidate, $state['offline'], true)) {
+            $thrower = $candidate;
             break;
         }
     }
-    $s['thrower'] = $pick;
-    $s['thrower_team'] = $team;
-    $s['phase'] = 'turn';
-    $s['hit'] = null;
-    $s['pending_hit'] = null;
-    $g->changed = true;
+    $state['thrower'] = $thrower;
+    $state['thrower_team'] = $team;
+    $state['phase'] = 'turn';
+    $state['hit'] = null;
+    $state['pending_hit'] = null;
+    $game->changed = true;
 }
 
-function next_turn($g)
+/**
+ * @param Game $game A locked game.
+ * @return void
+ */
+function next_turn($game)
 {
-    $g->s['turn_index']++;
-    begin_turn($g);
+    $game->s['turn_index']++;
+    begin_turn($game);
 }
 
-function advance($g)
+/**
+ * Moves past a screen that waits for the thrower: after a Strafbier the throw result rolled
+ * earlier takes effect, otherwise the next turn starts. Does nothing in other phases.
+ *
+ * @param Game $game A locked game.
+ * @return void
+ */
+function advance($game)
 {
-    switch ($g->s['phase']) {
+    switch ($game->s['phase']) {
         case 'strafbier':
-            resolve_throw($g, $g->s['pending_hit']);
+            resolve_throw($game, $game->s['pending_hit']);
             break;
         case 'turn':
         case 'miss':
         case 'stop':
-            next_turn($g);
+            next_turn($game);
             break;
     }
 }
 
-function do_throw($g)
+/**
+ * Rolls the throw: hit or miss by hitChance. In Strafbier mode a beerChance roll may first
+ * show the Strafbier screen; the throw result is then kept until the thrower moves on.
+ *
+ * @param Game $game A locked game in the 'turn' phase.
+ * @return void
+ */
+function do_throw($game)
 {
-    $set = $g->settings();
-    $hit = chance($set['hitChance']);
-    if ($set['strafbier'] && chance($set['beerChance'])) {
-        $g->s['phase'] = 'strafbier';
-        $g->s['pending_hit'] = $hit;
-        $g->changed = true;
+    $settings = $game->settings();
+    $isHit = chance($settings['hitChance']);
+    if ($settings['strafbier'] && chance($settings['beerChance'])) {
+        $game->s['phase'] = 'strafbier';
+        $game->s['pending_hit'] = $isHit;
+        $game->changed = true;
         return;
     }
-    resolve_throw($g, $hit);
+    resolve_throw($game, $isHit);
 }
 
-function resolve_throw($g, $hit)
+/**
+ * A hit starts the drinking countdown; a miss shows the miss screen.
+ *
+ * @param Game $game  A locked game.
+ * @param bool $isHit
+ * @return void
+ */
+function resolve_throw($game, $isHit)
 {
-    $g->s['pending_hit'] = null;
-    if ($hit) {
-        start_hit($g);
+    $game->s['pending_hit'] = null;
+    if ($isHit) {
+        start_hit($game);
     } else {
-        $g->s['phase'] = 'miss';
-        $g->changed = true;
+        $game->s['phase'] = 'miss';
+        $game->changed = true;
     }
 }
 
-function start_hit($g)
+/**
+ * Starts the drinking countdown after a hit. The opponents' jobs are open for claiming;
+ * a one-player team gets the setter job at once and has no ball to fetch.
+ *
+ * @param Game $game A locked game.
+ * @return void
+ */
+function start_hit($game)
 {
-    $s = &$g->s;
+    $state = &$game->s;
     // thrower_team, not team_of(): the thrower may have finished during a Strafbier.
-    $opp = $s['thrower_team'] === 1 ? 2 : 1;
-    $s['phase'] = 'countdown';
-    $s['hit'] = array(
+    $opponentTeam = $state['thrower_team'] === 1 ? 2 : 1;
+    $state['phase'] = 'countdown';
+    $state['hit'] = array(
         'id' => mt_rand(1, 2147483647),
-        'started' => $g->now,
-        'opp_team' => $opp,
+        'started' => $game->now,
+        'opp_team' => $opponentTeam,
         'setter' => null,
         'setter_start' => null,
         'timeline' => null,
@@ -510,157 +781,222 @@ function start_hit($g)
         'fetcher_end' => null,
         'end' => null,
         // A one-player team only has to put the bottle back up; nobody fetches the ball.
-        'solo' => count($s['teams'][$opp]) === 1,
+        'solo' => count($state['teams'][$opponentTeam]) === 1,
     );
-    $g->changed = true;
-    if ($s['hit']['solo']) {
-        assign_role($g, 'setter', $s['teams'][$opp][0]);
+    $game->changed = true;
+    if ($state['hit']['solo']) {
+        assign_role($game, 'setter', $state['teams'][$opponentTeam][0]);
     }
 }
 
-// A player whose beer is empty leaves the rotation; the first team with nobody left wins.
-function finish_player($g, $rid)
+/**
+ * The player's beer is empty: they leave their team's rotation and are listed as finished.
+ * The first team with nobody left wins and the game ends. If the player was the thrower,
+ * the game moves on without them.
+ *
+ * @param Game $game     A locked, running game.
+ * @param int  $rosterId A player who is still in a team.
+ * @return void
+ */
+function finish_player($game, $rosterId)
 {
-    $s = &$g->s;
-    $team = team_of($s, $rid);
-    $s['teams'][$team] = array_values(array_diff($s['teams'][$team], array($rid)));
-    $s['finished'][] = array('id' => $rid, 'team' => $team);
-    $g->changed = true;
-    if (!$s['teams'][$team]) {
-        $s['phase'] = 'over';
-        $s['winner'] = $team;
+    $state = &$game->s;
+    $team = team_of($state, $rosterId);
+    $state['teams'][$team] = array_values(array_diff($state['teams'][$team], array($rosterId)));
+    $state['finished'][] = array('id' => $rosterId, 'team' => $team);
+    $game->changed = true;
+    if (!$state['teams'][$team]) {
+        $state['phase'] = 'over';
+        $state['winner'] = $team;
         return;
     }
-    if (thrower_stuck($s)) {
-        advance($g);
+    if (thrower_stuck($state)) {
+        advance($game);
     }
 }
 
-function roles_open($h)
+/**
+ * @param array $hit Game::$s['hit']
+ * @return bool True while a needed job is unassigned: the setter always, the fetcher
+ *              unless the running team has only one player.
+ */
+function roles_open($hit)
 {
-    return $h['setter'] === null || ($h['fetcher'] === null && empty($h['solo']));
+    return $hit['setter'] === null || ($hit['fetcher'] === null && empty($hit['solo']));
 }
 
-// One draw per role: speed 1 -> x1.4, 5 -> x1.0, 10 -> x0.5, times the random variance.
-function role_factor($g, $rid)
+/**
+ * Time factor for one job: speed 1 -> x1.4, 5 -> x1.0, 10 -> x0.5, times a random draw
+ * within +/- variance. Drawn once per job, so a player has an overall fast or slow run.
+ *
+ * @param Game $game
+ * @param int  $rosterId
+ * @return float
+ */
+function role_factor($game, $rosterId)
 {
-    $set = $g->settings();
-    $speed = isset($g->players[$rid]) ? $g->players[$rid]['speed'] : 5;
-    $v = $set['variance'] / 100;
-    return (1.5 - 0.1 * $speed) * (1 + $v * (2 * rnd() - 1));
+    $settings = $game->settings();
+    $speed = isset($game->players[$rosterId]) ? $game->players[$rosterId]['speed'] : 5;
+    $variance = $settings['variance'] / 100;
+    return (1.5 - 0.1 * $speed) * (1 + $variance * (2 * rnd() - 1));
 }
 
-// At most one tip-over, somewhere on the way back.
-function setter_timeline($start, $hin, $auf, $zur, $tipChance)
+/**
+ * Precomputes the setter's stages as absolute end times, so every phone can show the current
+ * stage without asking the server. With $tipChance the bottle tips over at most once, on the
+ * way back: the setter runs back to it, sets it up again and runs back again.
+ *
+ * @param float $start          When the setter starts running.
+ * @param float $runToSeconds   Time to the bottle, already scaled by role_factor().
+ * @param float $setUpSeconds   Time to set the bottle up, already scaled.
+ * @param float $runBackSeconds Time back behind the line, already scaled.
+ * @param int   $tipChance      Percent chance of one tip-over.
+ * @return array [stages, tipped]: stages is a list of ['stage' => 'hin'|'auf'|'zurueck'|
+ *               'umgefallen', 'end' => float]; tipped is true if the bottle tipped over.
+ */
+function setter_timeline($start, $runToSeconds, $setUpSeconds, $runBackSeconds, $tipChance)
 {
-    $a = $start + $hin;
-    $b = $a + $auf;
-    $tl = array(
-        array('stage' => 'hin', 'end' => $a),
-        array('stage' => 'auf', 'end' => $b),
+    $atBottle = $start + $runToSeconds;
+    $standing = $atBottle + $setUpSeconds;
+    $stages = array(
+        array('stage' => 'hin', 'end' => $atBottle),
+        array('stage' => 'auf', 'end' => $standing),
     );
     $tipped = chance($tipChance);
     if ($tipped) {
-        $covered = (0.2 + 0.7 * rnd()) * $zur;
-        $tipAt = $b + $covered;
-        $backAt = $tipAt + $covered;
-        $upAt = $backAt + $auf;
-        $tl[] = array('stage' => 'zurueck', 'end' => $tipAt);
-        $tl[] = array('stage' => 'umgefallen', 'end' => $backAt);
-        $tl[] = array('stage' => 'auf', 'end' => $upAt);
-        $tl[] = array('stage' => 'zurueck', 'end' => $upAt + $zur);
+        $covered = (0.2 + 0.7 * rnd()) * $runBackSeconds;
+        $tipAt = $standing + $covered;
+        $backAtBottle = $tipAt + $covered;
+        $standingAgain = $backAtBottle + $setUpSeconds;
+        $stages[] = array('stage' => 'zurueck', 'end' => $tipAt);
+        $stages[] = array('stage' => 'umgefallen', 'end' => $backAtBottle);
+        $stages[] = array('stage' => 'auf', 'end' => $standingAgain);
+        $stages[] = array('stage' => 'zurueck', 'end' => $standingAgain + $runBackSeconds);
     } else {
-        $tl[] = array('stage' => 'zurueck', 'end' => $b + $zur);
+        $stages[] = array('stage' => 'zurueck', 'end' => $standing + $runBackSeconds);
     }
-    return array($tl, $tipped);
+    return array($stages, $tipped);
 }
 
-function assign_role($g, $role, $rid)
+/**
+ * Gives a player a job and works out when they are done. Someone doing both jobs (only when
+ * nobody else is available) does them one after the other. Once every needed job is
+ * assigned, the countdown end is known.
+ *
+ * @param Game   $game     A locked game in the 'countdown' phase.
+ * @param string $role     'setter' (Aufstellen) or 'fetcher' (Ball holen).
+ * @param int    $rosterId
+ * @return void
+ */
+function assign_role($game, $role, $rosterId)
 {
-    $h = &$g->s['hit'];
-    $other = $role === 'setter' ? 'fetcher' : 'setter';
-    $start = $g->now;
-    if ($h[$other] === $rid && $h[$other . '_end'] !== null) {
-        $start = max($start, $h[$other . '_end']);
+    $hit = &$game->s['hit'];
+    $otherRole = $role === 'setter' ? 'fetcher' : 'setter';
+    $start = $game->now;
+    if ($hit[$otherRole] === $rosterId && $hit[$otherRole . '_end'] !== null) {
+        $start = max($start, $hit[$otherRole . '_end']);
     }
-    $set = $g->settings();
-    $f = role_factor($g, $rid);
+    $settings = $game->settings();
+    $factor = role_factor($game, $rosterId);
     if ($role === 'setter') {
-        $res = setter_timeline($start, $f * $set['tRunTo'], $f * $set['tSetUp'], $f * $set['tRunBack'], $set['tipChance']);
-        $h['setter'] = $rid;
-        $h['setter_start'] = $start;
-        $h['timeline'] = $res[0];
-        $h['tipped'] = $res[1];
-        $h['setter_end'] = $res[0][count($res[0]) - 1]['end'];
+        $result = setter_timeline(
+            $start,
+            $factor * $settings['tRunTo'],
+            $factor * $settings['tSetUp'],
+            $factor * $settings['tRunBack'],
+            $settings['tipChance']
+        );
+        $hit['setter'] = $rosterId;
+        $hit['setter_start'] = $start;
+        $hit['timeline'] = $result[0];
+        $hit['tipped'] = $result[1];
+        $hit['setter_end'] = $result[0][count($result[0]) - 1]['end'];
     } else {
-        $h['fetcher'] = $rid;
-        $h['fetcher_start'] = $start;
-        $h['fetcher_end'] = $start + $f * $set['tFetch'];
+        $hit['fetcher'] = $rosterId;
+        $hit['fetcher_start'] = $start;
+        $hit['fetcher_end'] = $start + $factor * $settings['tFetch'];
     }
-    if (!roles_open($h)) {
-        $h['end'] = $h['fetcher'] === null ? $h['setter_end'] : max($h['setter_end'], $h['fetcher_end']);
+    if (!roles_open($hit)) {
+        $hit['end'] = $hit['fetcher'] === null ? $hit['setter_end'] : max($hit['setter_end'], $hit['fetcher_end']);
     }
-    $g->changed = true;
+    $game->changed = true;
 }
 
-function auto_assign($g)
+/**
+ * Assigns the jobs nobody claimed within CLAIM_TIMEOUT, picking at random among online
+ * opponents without a job. Falls back to an online player who already has the other job,
+ * then to offline players, so the countdown can always end.
+ *
+ * @param Game $game A locked game in the 'countdown' phase.
+ * @return void
+ */
+function auto_assign($game)
 {
-    $s = $g->s;
-    $opps = $s['teams'][$s['hit']['opp_team']];
-    $offline = $s['offline'];
+    $state = $game->s;
+    $opponents = $state['teams'][$state['hit']['opp_team']];
+    $offline = $state['offline'];
     foreach (array('setter', 'fetcher') as $role) {
-        $h = $g->s['hit'];
-        if ($h[$role] !== null || ($role === 'fetcher' && !empty($h['solo']))) {
+        $hit = $game->s['hit'];
+        if ($hit[$role] !== null || ($role === 'fetcher' && !empty($hit['solo']))) {
             continue;
         }
-        $taken = $role === 'setter' ? $h['fetcher'] : $h['setter'];
+        $busy = $role === 'setter' ? $hit['fetcher'] : $hit['setter'];
         $online = array();
         $free = array();
-        foreach ($opps as $id) {
-            if (in_array($id, $offline, true)) {
+        foreach ($opponents as $rosterId) {
+            if (in_array($rosterId, $offline, true)) {
                 continue;
             }
-            $online[] = $id;
-            if ($id !== $taken) {
-                $free[] = $id;
+            $online[] = $rosterId;
+            if ($rosterId !== $busy) {
+                $free[] = $rosterId;
             }
         }
-        $pool = $free ? $free : ($online ? $online : $opps);
-        assign_role($g, $role, $pool[mt_rand(0, count($pool) - 1)]);
+        $pool = $free ? $free : ($online ? $online : $opponents);
+        assign_role($game, $role, $pool[mt_rand(0, count($pool) - 1)]);
     }
 }
 
-function payload($g, $token)
+/**
+ * Everything a phone needs to draw its screen: state, players, roster, a few settings,
+ * the server time for clock sync, and which player the token belongs to ('me').
+ * The throw result rolled before a Strafbier is left out, so it can't be read early.
+ *
+ * @param Game   $game
+ * @param string $token The requesting player's token; '' for none.
+ * @return array
+ */
+function payload($game, $token)
 {
-    $me = $g->byToken($token);
+    $me = $game->byToken($token);
     $players = array();
-    foreach ($g->players as $p) {
+    foreach ($game->players as $player) {
         $players[] = array(
-            'id' => $p['id'],
-            'name' => $p['name'],
-            'team' => $p['team'],
-            'ready' => $p['ready'],
-            'online' => !$g->isOffline($p),
+            'id' => $player['id'],
+            'name' => $player['name'],
+            'team' => $player['team'],
+            'ready' => $player['ready'],
+            'online' => !$game->isOffline($player),
         );
     }
     $roster = array();
-    foreach (db()->query('SELECT id, name FROM roster ORDER BY name')->fetchAll() as $r) {
-        $roster[] = array('id' => (int)$r['id'], 'name' => $r['name']);
+    foreach (db()->query('SELECT id, name FROM roster ORDER BY name')->fetchAll() as $row) {
+        $roster[] = array('id' => (int)$row['id'], 'name' => $row['name']);
     }
-    $set = $g->settings();
-    $s = $g->s;
-    unset($s['pending_hit']);
+    $settings = $game->settings();
+    $state = $game->s;
+    unset($state['pending_hit']);
     return array(
-        'v' => $g->v,
+        'v' => $game->v,
         'now' => now(),
         'me' => $me ? $me['id'] : null,
-        's' => $s,
+        's' => $state,
         'players' => $players,
         'roster' => $roster,
         'settings' => array(
-            'team1Name' => $set['team1Name'],
-            'team2Name' => $set['team2Name'],
-            'transport' => $set['transport'],
+            'team1Name' => $settings['team1Name'],
+            'team2Name' => $settings['team2Name'],
+            'transport' => $settings['transport'],
             'claimTimeout' => CLAIM_TIMEOUT,
         ),
     );
